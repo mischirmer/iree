@@ -13,9 +13,10 @@
 #include "iree/runtime/api.h"
 
 extern const iree_hal_executable_library_header_t**
-simple_mul_dispatch_0_library_query(
+simple_mul_linked_library_query(
     iree_hal_executable_library_version_t max_version,
     const iree_hal_executable_environment_v0_t* environment);
+
 // A function to create the bytecode or C module.
 extern iree_status_t create_module(iree_vm_instance_t* instance,
                                    iree_vm_module_t** out_module);
@@ -33,7 +34,7 @@ iree_status_t create_device_with_static_loader(iree_allocator_t host_allocator,
 
   // Register the statically linked executable library.
   const iree_hal_executable_library_query_fn_t libraries[] = {
-      simple_mul_dispatch_0_library_query,
+      simple_mul_linked_library_query,
   };
   iree_hal_executable_loader_t* library_loader = NULL;
   iree_status_t status = iree_hal_static_library_loader_create(
@@ -60,6 +61,27 @@ iree_status_t create_device_with_static_loader(iree_allocator_t host_allocator,
   iree_hal_executable_loader_release(library_loader);
   return status;
 }
+
+const iree_hal_dim_t a_shape[2] = {4, 3};
+const iree_hal_dim_t b_shape[2] = {3, 5};
+
+float A[4*3] = {
+  // 4 rows, 3 cols
+  1, 2, 3,
+  4, 5, 6,
+  7, 8, 9,
+  10, 11, 12
+};
+
+float B[3*5] = {
+  // 3 rows, 5 cols
+  1,  2,  3,  4,  5,
+  6,  7,  8,  9, 10,
+  11, 12, 13, 14, 15
+};
+
+iree_hal_buffer_view_t* a_bv = NULL;
+iree_hal_buffer_view_t* b_bv = NULL;
 
 iree_status_t Run() {
   iree_status_t status = iree_ok_status();
@@ -104,7 +126,7 @@ iree_status_t Run() {
   }
 
   // Lookup the entry point function call.
-  const char kMainFunctionName[] = "module.simple_mul";
+  const char kMainFunctionName[] = "module.matmul_dynamic";
   iree_runtime_call_t call;
   memset(&call, 0, sizeof(call));
   if (iree_status_is_ok(status)) {
@@ -112,83 +134,75 @@ iree_status_t Run() {
         session, iree_make_cstring_view(kMainFunctionName), &call);
   }
 
-  // Populate initial values for 4 * 2 = 8.
-  const int kElementCount = 4;
-  iree_hal_dim_t shape[1] = {kElementCount};
-  iree_hal_buffer_view_t* arg0_buffer_view = NULL;
-  iree_hal_buffer_view_t* arg1_buffer_view = NULL;
-  float kFloat4[] = {4.0f, 4.0f, 4.0f, 4.0f};
-  float kFloat2[] = {2.0f, 2.0f, 2.0f, 2.0f};
 
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_buffer_view_allocate_buffer_copy(
-        device, iree_hal_device_allocator(device), IREE_ARRAYSIZE(shape), shape,
-        IREE_HAL_ELEMENT_TYPE_FLOAT_32, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
-        (iree_hal_buffer_params_t){
-            .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
-            .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
-        },
-        iree_make_const_byte_span((void*)kFloat4,
-                                  sizeof(float) * kElementCount),
-        &arg0_buffer_view);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_buffer_view_allocate_buffer_copy(
-        device, iree_hal_device_allocator(device), IREE_ARRAYSIZE(shape), shape,
-        IREE_HAL_ELEMENT_TYPE_FLOAT_32, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
-        (iree_hal_buffer_params_t){
-            .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
-            .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
-        },
-        iree_make_const_byte_span((void*)kFloat2,
-                                  sizeof(float) * kElementCount),
-        &arg1_buffer_view);
-  }
+  // Allocate & upload A
+if (iree_status_is_ok(status)) {
+  status = iree_hal_buffer_view_allocate_buffer_copy(
+      device, iree_hal_device_allocator(device),
+      /*shape_rank=*/IREE_ARRAYSIZE(a_shape), a_shape,
+      IREE_HAL_ELEMENT_TYPE_FLOAT_32, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      (iree_hal_buffer_params_t){
+          .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+          .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
+      },
+      iree_make_const_byte_span((void*)A, sizeof(A)),
+      &a_bv);
+}
 
-  // Queue buffer views for input.
-  if (iree_status_is_ok(status)) {
-    status =
-        iree_runtime_call_inputs_push_back_buffer_view(&call, arg0_buffer_view);
-  }
-  iree_hal_buffer_view_release(arg0_buffer_view);
+// Allocate & upload B
+if (iree_status_is_ok(status)) {
+  status = iree_hal_buffer_view_allocate_buffer_copy(
+      device, iree_hal_device_allocator(device),
+      /*shape_rank=*/IREE_ARRAYSIZE(b_shape), b_shape,
+      IREE_HAL_ELEMENT_TYPE_FLOAT_32, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      (iree_hal_buffer_params_t){
+          .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+          .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
+      },
+      iree_make_const_byte_span((void*)B, sizeof(B)), &b_bv);
+}
 
-  if (iree_status_is_ok(status)) {
-    status =
-        iree_runtime_call_inputs_push_back_buffer_view(&call, arg1_buffer_view);
-  }
-  iree_hal_buffer_view_release(arg1_buffer_view);
+if (iree_status_is_ok(status)) {
+  status = iree_runtime_call_inputs_push_back_buffer_view(&call, a_bv);
+}
+iree_hal_buffer_view_release(a_bv);
 
-  // Invoke call.
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_invoke(&call, /*flags=*/0);
-  }
+if (iree_status_is_ok(status)) {
+  status = iree_runtime_call_inputs_push_back_buffer_view(&call, b_bv);
+}
+iree_hal_buffer_view_release(b_bv);
 
-  // Retrieve output buffer view with results from the invocation.
-  iree_hal_buffer_view_t* ret_buffer_view = NULL;
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_outputs_pop_front_buffer_view(&call,
-                                                             &ret_buffer_view);
-  }
+// Invoke call.
+if (iree_status_is_ok(status)) {
+  status = iree_runtime_call_invoke(&call, /*flags=*/0);
+}
 
-  // Read back the results and ensure we got the right values.
-  float results[] = {0.0f, 0.0f, 0.0f, 0.0f};
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_device_transfer_d2h(
-        device, iree_hal_buffer_view_buffer(ret_buffer_view), 0, results,
-        sizeof(results), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
-        iree_infinite_timeout());
-  }
-  if (iree_status_is_ok(status)) {
-    for (iree_host_size_t i = 0; i < IREE_ARRAYSIZE(results); ++i) {
-      if (results[i] != 8.0f) {
-        status = iree_make_status(IREE_STATUS_UNKNOWN, "result mismatches");
-        break;
-      }
+// Retrieve output buffer view with results from the invocation.
+iree_hal_buffer_view_t* c_bv = NULL;
+if (iree_status_is_ok(status)) {
+  status = iree_runtime_call_outputs_pop_front_buffer_view(&call, &c_bv);
+}
+
+// Read back results (row-major 4x5 = 20 floats)
+float C[4 * 5] = {0};
+if (iree_status_is_ok(status)) {
+  status = iree_hal_device_transfer_d2h(
+      device, iree_hal_buffer_view_buffer(c_bv), /*source_offset=*/0, C,
+      sizeof(C), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+      iree_infinite_timeout());
+}
+
+if (iree_status_is_ok(status)) {
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 5; ++j) {
+      printf("%8.3f ", C[i * 5 + j]);
     }
+    printf("\n");
   }
+}
 
   // Cleanup call and buffers.
-  iree_hal_buffer_view_release(ret_buffer_view);
+  iree_hal_buffer_view_release(c_bv);
   iree_runtime_call_deinitialize(&call);
 
   // Cleanup session and instance.
