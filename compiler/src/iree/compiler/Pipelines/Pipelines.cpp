@@ -258,6 +258,11 @@ void buildIREEPrecompileTransformPassPipeline(
         hooks.beforePhase(IREEVMPipelinePhase::GlobalOptimization, passManager);
       GlobalOptimization::buildGlobalOptimizationPassPipeline(
           passManager, globalTransformOptions);
+      // Plugin extension point: allow passes to run after built-in global
+      // optimization but prior to dispatch creation.
+      if (hooks.pipelineExtensions) {
+        hooks.pipelineExtensions->extendGlobalOptimizationPassPipeline(passManager);
+      }
       if (hooks.afterPhase)
         hooks.afterPhase(IREEVMPipelinePhase::GlobalOptimization, passManager);
       if (globalOptimizationOptions.constEval) {

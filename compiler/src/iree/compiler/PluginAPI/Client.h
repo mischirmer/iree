@@ -81,6 +81,17 @@ public:
 
   // Adds passes to the |buildPreprocessingPassPipeline| pipeline at the end.
   virtual void extendPreprocessingPassPipeline(OpPassManager &passManager) {}
+
+  // Adds passes immediately after the builtin GlobalOptimization pass
+  // pipeline has run (and before DispatchCreation). This extension point
+  // allows plugins to operate on IR after high-level canonicalization and
+  // legalization but prior to dispatch formation and bufferization steps,
+  // making it suitable for whole-function transformations that may introduce
+  // ops (like memref.*) that earlier phases mark illegal. Downstream
+  // pipelines should regard any transformations here as optional/off-by-
+  // default. NOTE: this is a provisional API and may evolve; plugins should
+  // defensively check preconditions.
+  virtual void extendGlobalOptimizationPassPipeline(OpPassManager &passManager) {}
 };
 
 // Policy for how to activate the plugin.

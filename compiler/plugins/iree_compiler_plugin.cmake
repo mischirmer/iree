@@ -47,3 +47,9 @@ endif()
 if(IREE_TARGET_BACKEND_WEBGPU_SPIRV)
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/target/WebGPUSPIRV target/WebGPUSPIRV)
 endif()
+
+
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/hwacc hwacc)
+
+# add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/instrument_matmul instrument_matmul)
+# add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/instrument_convolution instrument_convolution)

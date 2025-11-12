@@ -323,13 +323,16 @@ if(APPLE)
   set(IREE_HAL_DRIVER_VULKAN_DEFAULT OFF)
 endif()
 
+set(IREE_HAL_DRIVER_HWACC_HOST_DEFAULT ON)
+
+
 option(IREE_HAL_DRIVER_AMDGPU "Enables the `amdgpu` runtime HAL driver" ${IREE_HAL_DRIVER_AMDGPU_DEFAULT})
 option(IREE_HAL_DRIVER_CUDA "Enables the 'cuda' runtime HAL driver" ${IREE_HAL_DRIVER_CUDA_DEFAULT})
 option(IREE_HAL_DRIVER_HIP "Enables the 'hip' runtime HAL driver" ${IREE_HAL_DRIVER_HIP_DEFAULT})
 option(IREE_HAL_DRIVER_LOCAL_SYNC "Enables the 'local-sync' runtime HAL driver" ${IREE_HAL_DRIVER_DEFAULTS})
 option(IREE_HAL_DRIVER_LOCAL_TASK "Enables the 'local-task' runtime HAL driver" ${IREE_HAL_DRIVER_DEFAULTS})
 option(IREE_HAL_DRIVER_METAL "Enables the 'metal' runtime HAL driver" ${IREE_HAL_DRIVER_METAL_DEFAULT})
-option(IREE_HAL_DRIVER_NULL "Enables the 'null' runtime HAL driver" ${IREE_HAL_DRIVER_NULL_DEFAULT})
+option(IREE_HAL_DRIVER_HWACC_HOST "Enables the 'hwacc-host' runtime HAL driver" ${IREE_HAL_DRIVER_HWACC_HOST_DEFAULT})
 option(IREE_HAL_DRIVER_VULKAN "Enables the 'vulkan' runtime HAL driver" ${IREE_HAL_DRIVER_VULKAN_DEFAULT})
 
 option(IREE_HAL_EXECUTABLE_LOADER_DEFAULTS "Sets the default value for all runtime HAL executable loaders" ON)
@@ -394,6 +397,9 @@ if(IREE_HAL_DRIVER_METAL)
 endif()
 if(IREE_HAL_DRIVER_NULL)
   message(STATUS "  - null")
+endif()
+if(IREE_HAL_DRIVER_HWACC_HOST)
+  message(STATUS "  - hwacc-host")
 endif()
 if(IREE_HAL_DRIVER_VULKAN)
   message(STATUS "  - vulkan")
@@ -1305,3 +1311,7 @@ iree_add_install_target(
   COMPONENT IREETools-Runtime
   ADD_TO iree-install-tools
 )
+
+
+add_library(hwacc STATIC runtime/hwacc_gemm.cpp)
+set_property(TARGET hwacc PROPERTY POSITION_INDEPENDENT_CODE ON)
