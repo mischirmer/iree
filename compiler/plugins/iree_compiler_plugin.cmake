@@ -51,6 +51,3 @@ endif()
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/hwacc hwacc)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/abft abft)
-
-# add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/instrument_matmul instrument_matmul)
-# add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/instrument_convolution instrument_convolution)

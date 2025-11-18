@@ -15,13 +15,28 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+// Command line option parsing for the standalone flag used by the pass.
+#include "llvm/Support/CommandLine.h"
 
 using namespace mlir;
+
+// Global CLI flag to enable Full-Checksum elementwise comparisons. Using a
+// static command-line option avoids putting non-copyable llvm::cl::opt into
+// the pass object (PassWrapper needs to be copyable).
+static llvm::cl::opt<bool> abftEnableFuC("abft-enable-fuc",
+                     llvm::cl::desc(
+                       "Enable full elementwise checksum (t1/t2) comparisons"),
+                     llvm::cl::init(false));
 
 namespace {
 
 struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ABFTPass)
+
+  // NOTE: the CLI flag is defined as a static llvm::cl::opt above. We avoid
+  // storing an Option<> member inside the pass because llvm::cl::opt is
+  // non-copyable which breaks PassWrapper's cloning. Read the flag at
+  // run-time from `abftEnableFuC`.
 
   StringRef getArgument() const final { return "abft-insert-ones"; }
   StringRef getDescription() const final {
@@ -152,6 +167,80 @@ module {
 )mlir");
   (void)parsedEps;
 
+    // Full-checksum helper implementations (so the pass can emit full-checksum
+    // calls unconditionally). These compute:
+    //  - rowvec_mul_mat(rv, mat) -> vector: for each column j, sum_k rv[k]*mat[k,j]
+    //  - mat_mul_colvec(mat, cv) -> vector: for each row i, sum_j mat[i,j]*cv[j]
+    //  - vector_epsilon_compare(v1, v2, eps) -> () : elementwise assert(|v1-v2| < eps)
+    func::FuncOp parsedRowVec = ensureFunctionWithBody("rowvec_mul_mat", R"mlir(
+module {
+  func.func @rowvec_mul_mat(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %empty = tensor.empty(%n) : tensor<?xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
+    %res = linalg.generic {indexing_maps = [affine_map<(d0,d1)->(d0)>, affine_map<(d0,d1)->(d0,d1)>, affine_map<(d0,d1)->(d1)>], iterator_types = ["reduction","parallel"]}
+      ins(%rv, %mat : tensor<?xf32>, tensor<?x?xf32>) outs(%init : tensor<?xf32>) {
+      ^bb0(%a: f32, %b: f32, %acc: f32):
+        %prod = arith.mulf %a, %b : f32
+        %sum = arith.addf %prod, %acc : f32
+        linalg.yield %sum : f32
+    } -> tensor<?xf32>
+    return %res : tensor<?xf32>
+  }
+}
+)mlir");
+    (void)parsedRowVec;
+
+    func::FuncOp parsedMatCol = ensureFunctionWithBody("mat_mul_colvec", R"mlir(
+module {
+  func.func @mat_mul_colvec(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
+    %c0 = arith.constant 0 : index
+    %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %empty = tensor.empty(%m) : tensor<?xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
+    %res = linalg.generic {indexing_maps = [affine_map<(d0,d1)->(d0,d1)>, affine_map<(d0,d1)->(d1)>, affine_map<(d0,d1)->(d0)>], iterator_types = ["parallel","reduction"]}
+      ins(%mat, %cv : tensor<?x?xf32>, tensor<?xf32>) outs(%init : tensor<?xf32>) {
+      ^bb0(%a: f32, %b: f32, %acc: f32):
+        %prod = arith.mulf %a, %b : f32
+        %sum = arith.addf %prod, %acc : f32
+        linalg.yield %sum : f32
+    } -> tensor<?xf32>
+    return %res : tensor<?xf32>
+  }
+}
+)mlir");
+    (void)parsedMatCol;
+
+    func::FuncOp parsedVecEps = ensureFunctionWithBody("vector_epsilon_compare", R"mlir(
+module {
+  func.func @vector_epsilon_compare(%v1: tensor<?xf32>, %v2: tensor<?xf32>, %eps: f32) {
+    %c0 = arith.constant 0 : index
+    %n = tensor.dim %v1, %c0 : tensor<?xf32>
+    %empty = tensor.empty(%n) : tensor<?xf32>
+    %zero = arith.constant 0.0 : f32
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
+    // create an epsilon vector of length n so it can be passed into the generic
+    %eps_vec = tensor.empty(%n) : tensor<?xf32>
+    %eps_filled = linalg.fill ins(%eps : f32) outs(%eps_vec : tensor<?xf32>) -> tensor<?xf32>
+    linalg.generic {indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>], iterator_types = ["parallel"]}
+      ins(%v1, %v2, %eps_filled : tensor<?xf32>, tensor<?xf32>, tensor<?xf32>) outs(%init : tensor<?xf32>) {
+      ^bb0(%a: f32, %b: f32, %e: f32, %acc: f32):
+        %d = arith.subf %a, %b : f32
+        %ad = math.absf %d : f32
+        %ok = arith.cmpf olt, %ad, %e : f32
+        cf.assert %ok, "FIC: vector elements differ more than epsilon"
+        linalg.yield %acc : f32
+    } -> tensor<?xf32>
+    return
+  }
+}
+)mlir");
+    (void)parsedVecEps;
+
     // If any parse failed, fall back to inserting declaration-only functions
     // to keep the rest of the instrumentation working.
     OpBuilder modBuilder(module.getBodyRegion());
@@ -203,6 +292,9 @@ module {
   auto sumFn = module.lookupSymbol<func::FuncOp>(StringRef("matrix_sum"));
   auto dotFn = module.lookupSymbol<func::FuncOp>(StringRef("vector_dot_product"));
   auto epsFn = module.lookupSymbol<func::FuncOp>(StringRef("epsilon_compare"));
+  auto rowvecFn = module.lookupSymbol<func::FuncOp>(StringRef("rowvec_mul_mat"));
+  auto matcolFn = module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec"));
+  auto vecEpsFn = module.lookupSymbol<func::FuncOp>(StringRef("vector_epsilon_compare"));
 
     for (Operation *op : targets) {
       op->emitRemark() << "abft-ones: matched matmul for ones*A insertion";
@@ -314,6 +406,83 @@ module {
               // The epsilon scalar
               epsArgs.push_back(epsConst);
               bAfter.create<func::CallOp>(loc, StringRef("epsilon_compare"), TypeRange{}, ValueRange{epsArgs});
+
+              // Full-checksum additional checks (controlled by --abft-enable-fuc):
+              if (abftEnableFuC) {
+                auto epsAttrFuC = bAfter.getF32FloatAttr(1.0f);
+                auto epsConstFuC = bAfter.create<arith::ConstantOp>(loc, bAfter.getF32Type(), epsAttrFuC);
+                // t1 = A_checksum * B  (1xK * KxN -> 1xN)
+                if (rowvecFn && !rowvecFn.isExternal() && colFn && !colFn.isExternal()) {
+                SmallVector<Type, 1> t1Results;
+                for (Type t : rowvecFn.getFunctionType().getResults()) t1Results.push_back(t);
+                // Ensure arguments match rowvec_mul_mat expected input types.
+                SmallVector<Value, 2> t1Args;
+                auto rowvecTy = rowvecFn.getFunctionType();
+                // arg0: tmpA (vector)
+                if (rowvecTy.getNumInputs() >= 1)
+                  t1Args.push_back(tmpA.getType() == rowvecTy.getInput(0)
+                                     ? tmpA
+                                     : bAfter.create<tensor::CastOp>(loc, rowvecTy.getInput(0), tmpA).getResult());
+                // arg1: B (matrix)
+                if (rowvecTy.getNumInputs() >= 2)
+                  t1Args.push_back(B.getType() == rowvecTy.getInput(1)
+                                     ? B
+                                     : bAfter.create<tensor::CastOp>(loc, rowvecTy.getInput(1), B).getResult());
+                auto t1Call = bAfter.create<func::CallOp>(loc, StringRef("rowvec_mul_mat"), TypeRange(t1Results), ValueRange{t1Args});
+                Value t1 = t1Call.getResult(0);
+                // c1 = sum over rows of C -> column_checksum(C)
+                SmallVector<Type, 1> c1Results;
+                for (Type t : colFn.getFunctionType().getResults()) c1Results.push_back(t);
+                // Ensure C matches column_checksum expected input type.
+                Value c1Arg = C;
+                if (colFn) {
+                  Type expectedColArg = colFn.getFunctionType().getInput(0);
+                  if (c1Arg.getType() != expectedColArg)
+                    c1Arg = bAfter.create<tensor::CastOp>(loc, expectedColArg, c1Arg).getResult();
+                }
+                auto c1Call = bAfter.create<func::CallOp>(loc, StringRef("column_checksum"), TypeRange(c1Results), ValueRange{c1Arg});
+                Value c1 = c1Call.getResult(0);
+                // compare elementwise t1 and c1
+                if (vecEpsFn && !vecEpsFn.isExternal()) {
+                  bAfter.create<func::CallOp>(loc, StringRef("vector_epsilon_compare"), TypeRange{}, ValueRange{t1, c1, epsConstFuC});
+                }
+              }
+
+              // t2 = A * B_checksum (MxK * Kx1 -> Mx1)
+              if (matcolFn && !matcolFn.isExternal() && rowFn && !rowFn.isExternal()) {
+                SmallVector<Type, 1> t2Results;
+                for (Type t : matcolFn.getFunctionType().getResults()) t2Results.push_back(t);
+                // Ensure arguments match mat_mul_colvec expected input types.
+                SmallVector<Value, 2> t2Args;
+                auto matcolTy = matcolFn.getFunctionType();
+                if (matcolTy.getNumInputs() >= 1)
+                  t2Args.push_back(A.getType() == matcolTy.getInput(0)
+                                     ? A
+                                     : bAfter.create<tensor::CastOp>(loc, matcolTy.getInput(0), A).getResult());
+                if (matcolTy.getNumInputs() >= 2)
+                  t2Args.push_back(tmpB.getType() == matcolTy.getInput(1)
+                                     ? tmpB
+                                     : bAfter.create<tensor::CastOp>(loc, matcolTy.getInput(1), tmpB).getResult());
+                auto t2Call = bAfter.create<func::CallOp>(loc, StringRef("mat_mul_colvec"), TypeRange(t2Results), ValueRange{t2Args});
+                Value t2 = t2Call.getResult(0);
+                // c2 = sum over columns of C -> row_checksum(C)
+                SmallVector<Type, 1> c2Results;
+                for (Type t : rowFn.getFunctionType().getResults()) c2Results.push_back(t);
+                // Ensure C matches row_checksum expected input type.
+                Value c2Arg = C;
+                if (rowFn) {
+                  Type expectedRowArg = rowFn.getFunctionType().getInput(0);
+                  if (c2Arg.getType() != expectedRowArg)
+                    c2Arg = bAfter.create<tensor::CastOp>(loc, expectedRowArg, c2Arg).getResult();
+                }
+                auto c2Call = bAfter.create<func::CallOp>(loc, StringRef("row_checksum"), TypeRange(c2Results), ValueRange{c2Arg});
+                Value c2 = c2Call.getResult(0);
+                if (vecEpsFn && !vecEpsFn.isExternal()) {
+                  // Use the elementwise epsilon (epsConstFuC) for vector comparison.
+                  bAfter.create<func::CallOp>(loc, StringRef("vector_epsilon_compare"), TypeRange{}, ValueRange{t2, c2, epsConstFuC});
+                }
+              }
+              }
             }
           }
         }
