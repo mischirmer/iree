@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
+#include <vector>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,8 +49,8 @@ void descale_C(float* C, int64_t M, int64_t N) {
   }
 }
 
-float dot_product(const float* A_col_checksums, const float* B_row_checksums,
-                  int64_t K) {
+float dot_product(const std::vector<float>& A_col_checksums,
+                  const std::vector<float>& B_row_checksums, int64_t K) {
   float dot = 0.0f;
   for (int64_t k = 0; k < K; ++k) {
     dot += A_col_checksums[k] * B_row_checksums[k];
@@ -84,16 +85,14 @@ void hwacc_gemm_f32(const float* A, const float* B, float* C, int64_t M,
   // Setup random scaling factors for debuggin here
   extern float* g_scaling_factors_A;
   extern float* g_scaling_factors_B;
-  extern int64_t g_scaling_factors_count_A;
-  extern int64_t g_scaling_factors_count_B;
 
-  extern int g_seeded;
   init_random(M, N);
 
   // Happens on caller side
   // Calcaulate pre-checksums here
-  float* A_col_checksums = (float*)calloc((size_t)K, sizeof(float));
-  float* B_row_checksums = (float*)calloc((size_t)K, sizeof(float));
+  std::vector<float> A_col_checksums(K, 0.f);
+  std::vector<float> B_row_checksums(K, 0.f);
+
   for (int64_t k = 0; k < K; ++k) {
     for (int64_t m = 0; m < M; ++m) {
       A_col_checksums[k] += A[m * K + k];
@@ -146,8 +145,8 @@ void hwacc_gemm_f32(const float* A, const float* B, float* C, int64_t M,
   // descale_C(C, M, N);
 
   // Calculate post-checksums here (+ descaling)
-  float* C_row_checksums = (float*)calloc((size_t)M, sizeof(float));
-  float* C_col_checksums = (float*)calloc((size_t)N, sizeof(float));
+  std::vector<float> C_col_checksums(N, 0.f);
+  std::vector<float> C_row_checksums(M, 0.f);
   float oc = 0.0f;
   for (int64_t i = 0; i < M; ++i) {
     for (int64_t j = 0; j < N; ++j) {
@@ -161,8 +160,8 @@ void hwacc_gemm_f32(const float* A, const float* B, float* C, int64_t M,
   }
 
   // Calculate Row/Col for FullChecksum scheme
-  float* row_checksum = (float*)calloc((size_t)M, sizeof(float));
-  float* col_checksum = (float*)calloc((size_t)N, sizeof(float));
+  std::vector<float> row_checksum(M, 0.f);
+  std::vector<float> col_checksum(N, 0.f);
 
   for (int64_t j = 0; j < N; ++j) {
     float acc = 0.0f;
@@ -233,14 +232,6 @@ void hwacc_gemm_f32(const float* A, const float* B, float* C, int64_t M,
   } else {
     printf("GEMM result verification PASSED!\n");
   }
-
-  /* free temporaries */
-  free(A_modified);
-  free(B_modified);
-  free(C_row_checksums);
-  free(C_col_checksums);
-  free(A_col_checksums);
-  free(B_row_checksums);
 }
 
 #ifdef __cplusplus
