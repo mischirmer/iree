@@ -28,6 +28,14 @@ static llvm::cl::opt<bool> abftEnableFuC(
     llvm::cl::desc("Enable full elementwise checksum (t1/t2) comparisons"),
     llvm::cl::init(false));
 
+// Additional global CLI flag to enable scaling-related instrumentation. Kept as
+// a separate global flag (llvm::cl::opt) to avoid putting non-copyable
+// llvm::cl::opt members into the PassWrapper.
+static llvm::cl::opt<bool> abftEnableScaling(
+  "abft-enable-scaling",
+  llvm::cl::desc("Enable checksum scaling instrumentation"),
+  llvm::cl::init(false));
+
 namespace {
 
 struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
@@ -174,6 +182,38 @@ module {
 )mlir");
     (void)parsedEps;
 
+    // Provide simple in-module implementations for sampling helpers so the
+    // pass can emit calls without requiring external runtime imports. These
+    // are placeholders that fill the scale vectors with 1.0; a real runtime
+    // sampling implementation can replace them later.
+    func::FuncOp parsedSampleRow = ensureFunctionWithBody("sample_row_scales", R"mlir(
+module {
+  func.func @sample_row_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
+    %c0 = arith.constant 0 : index
+    %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %empty = tensor.empty(%m) : tensor<?xf32>
+    %one = arith.constant 1.0 : f32
+    %res = linalg.fill ins(%one : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
+    return %res : tensor<?xf32>
+  }
+}
+)mlir");
+    (void)parsedSampleRow;
+
+    func::FuncOp parsedSampleCol = ensureFunctionWithBody("sample_col_scales", R"mlir(
+module {
+  func.func @sample_col_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
+    %c1 = arith.constant 1 : index
+    %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %empty = tensor.empty(%n) : tensor<?xf32>
+    %one = arith.constant 1.0 : f32
+    %res = linalg.fill ins(%one : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
+    return %res : tensor<?xf32>
+  }
+}
+)mlir");
+    (void)parsedSampleCol;
+
     // Full-checksum helper implementations (so the pass can emit full-checksum
     // calls unconditionally). These compute:
     //  - rowvec_mul_mat(rv, mat) -> vector: for each column j, sum_k
@@ -263,6 +303,9 @@ module {
 
     auto maybeInsertDecl = [&](StringRef name, FunctionType fnTy) {
       if (!module.lookupSymbol<func::FuncOp>(name)) {
+        // Create a declaration-only function and mark it private. MLIR
+        // requires declaration-only (no-body) func.func symbols to be
+        // private; public declarations are not allowed.
         auto fn = modBuilder.create<func::FuncOp>(modLoc, name, fnTy);
         fn.setPrivate();
       }
@@ -291,6 +334,117 @@ module {
       maybeInsertDecl("epsilon_compare", ft);
     }
 
+    // Declarations for scaling helpers. Sampling functions are declared here
+    // and expected to be provided by the runtime (they sample random values
+    // in [-2,2]). Scaling/descaling helpers are provided with bodies where
+    // possible so the pass can emit calls directly.
+    if (!module.lookupSymbol<func::FuncOp>("sample_row_scales")) {
+      auto ft = FunctionType::get(ctx, TypeRange{dyn2d}, TypeRange{vecDyn});
+      maybeInsertDecl("sample_row_scales", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("sample_col_scales")) {
+      auto ft = FunctionType::get(ctx, TypeRange{dyn2d}, TypeRange{vecDyn});
+      maybeInsertDecl("sample_col_scales", ft);
+    }
+
+    // Scale rows: given matrix (m x n) and scales (m), produce scaled matrix
+    if (!module.lookupSymbol<func::FuncOp>("scale_matrix_rows")) {
+      // Provide a small body implementation for row scaling.
+      if (auto impl = ensureFunctionWithBody("scale_matrix_rows", R"mlir(
+module {
+  func.func @scale_matrix_rows(%mat: tensor<?x?xf32>, %scales: tensor<?xf32>) -> tensor<?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %empty = tensor.empty(%m, %n) : tensor<?x?xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+    // Broadcast the 1D scales vector across the second dimension (columns)
+    %res = linalg.generic {indexing_maps = [affine_map<(d0,d1)->(d0,d1)>, affine_map<(d0,d1)->(d0)>, affine_map<(d0,d1)->(d0,d1)>], iterator_types = ["parallel","parallel"]}
+      ins(%mat, %scales : tensor<?x?xf32>, tensor<?xf32>) outs(%init : tensor<?x?xf32>) {
+      ^bb0(%a: f32, %s: f32, %acc: f32):
+        %prod = arith.mulf %a, %s : f32
+        linalg.yield %prod : f32
+    } -> tensor<?x?xf32>
+    return %res : tensor<?x?xf32>
+  }
+}
+)mlir")) {
+        (void)impl;
+      }
+    }
+
+    // Scale columns: given matrix (m x n) and scales (n), produce scaled
+    // matrix where each column j is multiplied by scales[j].
+    if (!module.lookupSymbol<func::FuncOp>("scale_matrix_cols")) {
+      if (auto impl = ensureFunctionWithBody("scale_matrix_cols", R"mlir(
+module {
+  func.func @scale_matrix_cols(%mat: tensor<?x?xf32>, %scales: tensor<?xf32>) -> tensor<?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %empty = tensor.empty(%m, %n) : tensor<?x?xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+    %res = linalg.generic {indexing_maps = [affine_map<(d0,d1)->(d0,d1)>, affine_map<(d0,d1)->(d1)>, affine_map<(d0,d1)->(d0,d1)>], iterator_types = ["parallel","parallel"]}
+      ins(%mat, %scales : tensor<?x?xf32>, tensor<?xf32>) outs(%init : tensor<?x?xf32>) {
+      ^bb0(%a: f32, %s: f32, %acc: f32):
+        %prod = arith.mulf %a, %s : f32
+        linalg.yield %prod : f32
+    } -> tensor<?x?xf32>
+    return %res : tensor<?x?xf32>
+  }
+}
+)mlir")) {
+        (void)impl;
+      }
+    }
+
+    // Descale: given C' = diag(row)*C*diag(col) and the scale vectors,
+    // compute C = diag(1/row) * C' * diag(1/col).
+    if (!module.lookupSymbol<func::FuncOp>("descale_matrix")) {
+      if (auto impl = ensureFunctionWithBody("descale_matrix", R"mlir(
+module {
+  func.func @descale_matrix(%mat: tensor<?x?xf32>, %row_scales: tensor<?xf32>, %col_scales: tensor<?xf32>) -> tensor<?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %empty = tensor.empty(%m, %n) : tensor<?x?xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+    %res = linalg.generic {indexing_maps = [affine_map<(d0,d1)->(d0,d1)>, affine_map<(d0,d1)->(d0)>, affine_map<(d0,d1)->(d1)>, affine_map<(d0,d1)->(d0,d1)>], iterator_types = ["parallel","parallel"]}
+      ins(%mat, %row_scales, %col_scales : tensor<?x?xf32>, tensor<?xf32>, tensor<?xf32>) outs(%init : tensor<?x?xf32>) {
+      ^bb0(%a: f32, %rs: f32, %cs: f32, %acc: f32):
+        %tmp = arith.divf %a, %rs : f32
+        %inv = arith.divf %tmp, %cs : f32
+        linalg.yield %inv : f32
+    } -> tensor<?x?xf32>
+    return %res : tensor<?x?xf32>
+  }
+}
+)mlir")) {
+        (void)impl;
+      }
+    }
+
+    // Ensure declaration-only fallbacks exist for the scaling helpers in case
+    // parsing their bodies failed above.
+    if (!module.lookupSymbol<func::FuncOp>("scale_matrix_rows")) {
+      auto ft = FunctionType::get(ctx, TypeRange{dyn2d, vecDyn}, TypeRange{dyn2d});
+      maybeInsertDecl("scale_matrix_rows", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("scale_matrix_cols")) {
+      auto ft = FunctionType::get(ctx, TypeRange{dyn2d, vecDyn}, TypeRange{dyn2d});
+      maybeInsertDecl("scale_matrix_cols", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("descale_matrix")) {
+      auto ft = FunctionType::get(ctx, TypeRange{dyn2d, vecDyn, vecDyn}, TypeRange{dyn2d});
+      maybeInsertDecl("descale_matrix", ft);
+    }
+
     // Collect matmul ops inside this function only to avoid mutating while
     // walking.
     SmallVector<Operation *, 8> targets;
@@ -314,6 +468,16 @@ module {
         module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec"));
     auto vecEpsFn =
         module.lookupSymbol<func::FuncOp>(StringRef("vector_epsilon_compare"));
+  auto sampleRowFn = module.lookupSymbol<func::FuncOp>(
+    StringRef("sample_row_scales"));
+  auto sampleColFn = module.lookupSymbol<func::FuncOp>(
+    StringRef("sample_col_scales"));
+  auto scaleRowsFn = module.lookupSymbol<func::FuncOp>(
+    StringRef("scale_matrix_rows"));
+  auto scaleColsFn = module.lookupSymbol<func::FuncOp>(
+    StringRef("scale_matrix_cols"));
+  auto descaleFn = module.lookupSymbol<func::FuncOp>(
+    StringRef("descale_matrix"));
 
     for (Operation *op : targets) {
       op->emitRemark() << "abft-ones: matched matmul for ones*A insertion";
@@ -363,6 +527,10 @@ module {
       Value tmpA = call.getResult(0);
       (void)tmpA;
 
+  // Prepare holders for optional scaling vectors (per-operation).
+  Value rowScales;
+  Value colScales;
+
       // Insert row checksum for B when it is a tensor.
       Value tmpB;
       if (rowFn && isa<RankedTensorType>(B.getType())) {
@@ -381,6 +549,74 @@ module {
         tmpB = rowCall.getResult(0);
       }
 
+      // If scaling is enabled, sample scales and scale A/B before the
+      // matmul. Sampling functions are expected to exist (declaration); the
+      // scale helpers may provide bodies.
+      if (abftEnableScaling && sampleRowFn && sampleColFn && scaleRowsFn &&
+          scaleColsFn) {
+        // Sample row scales for A and column scales for B.
+        SmallVector<Type, 1> sRes;
+        for (Type t : sampleRowFn.getFunctionType().getResults())
+          sRes.push_back(t);
+        // Ensure A matches the sample_row_scales expected input type.
+        Value sampArgA = A;
+        if (sampleRowFn) {
+          Type expectedSampleA = sampleRowFn.getFunctionType().getInput(0);
+          if (sampArgA.getType() != expectedSampleA)
+            sampArgA = b.create<tensor::CastOp>(loc, expectedSampleA, sampArgA).getResult();
+        }
+        auto sampRowCall = b.create<func::CallOp>(loc, StringRef("sample_row_scales"), TypeRange(sRes), ValueRange{sampArgA});
+        rowScales = sampRowCall.getResult(0);
+
+        SmallVector<Type, 1> sRes2;
+        for (Type t : sampleColFn.getFunctionType().getResults())
+          sRes2.push_back(t);
+        // Ensure B matches the sample_col_scales expected input type.
+        Value sampArgB = B;
+        if (sampleColFn) {
+          Type expectedSampleB = sampleColFn.getFunctionType().getInput(0);
+          if (sampArgB.getType() != expectedSampleB)
+            sampArgB = b.create<tensor::CastOp>(loc, expectedSampleB, sampArgB).getResult();
+        }
+        auto sampColCall = b.create<func::CallOp>(loc, StringRef("sample_col_scales"), TypeRange(sRes2), ValueRange{sampArgB});
+        colScales = sampColCall.getResult(0);
+
+        // Scale A rows -> scaledA
+        SmallVector<Type, 1> scaleARes;
+        for (Type t : scaleRowsFn.getFunctionType().getResults())
+          scaleARes.push_back(t);
+        // Ensure arg types match
+        Value scaleArgA = A;
+        auto expectedAArg = scaleRowsFn.getFunctionType().getInput(0);
+        if (scaleArgA.getType() != expectedAArg)
+          scaleArgA = b.create<tensor::CastOp>(loc, expectedAArg, scaleArgA).getResult();
+        Value scaleArgScalesA = rowScales;
+        auto expectedScalesAArg = scaleRowsFn.getFunctionType().getInput(1);
+        if (scaleArgScalesA.getType() != expectedScalesAArg)
+          scaleArgScalesA = b.create<tensor::CastOp>(loc, expectedScalesAArg, scaleArgScalesA).getResult();
+        auto scaleACall = b.create<func::CallOp>(loc, StringRef("scale_matrix_rows"), TypeRange(scaleARes), ValueRange{scaleArgA, scaleArgScalesA});
+        Value scaledA = scaleACall.getResult(0);
+
+        // Scale B columns -> scaledB
+        SmallVector<Type, 1> scaleBRes;
+        for (Type t : scaleColsFn.getFunctionType().getResults())
+          scaleBRes.push_back(t);
+        Value scaleArgB = B;
+        auto expectedBArg = scaleColsFn.getFunctionType().getInput(0);
+        if (scaleArgB.getType() != expectedBArg)
+          scaleArgB = b.create<tensor::CastOp>(loc, expectedBArg, scaleArgB).getResult();
+        Value scaleArgScalesB = colScales;
+        auto expectedScalesBArg = scaleColsFn.getFunctionType().getInput(1);
+        if (scaleArgScalesB.getType() != expectedScalesBArg)
+          scaleArgScalesB = b.create<tensor::CastOp>(loc, expectedScalesBArg, scaleArgScalesB).getResult();
+        auto scaleBCall = b.create<func::CallOp>(loc, StringRef("scale_matrix_cols"), TypeRange(scaleBRes), ValueRange{scaleArgB, scaleArgScalesB});
+        Value scaledB = scaleBCall.getResult(0);
+
+        // Replace the operands of the matmul to use scaled versions.
+        op->setOperand(0, scaledA);
+        op->setOperand(1, scaledB);
+      }
+
       // Insert matrix sum AFTER the matmul op to compute ones * C * ones.
       // Place the insertion point just after the matmul operation.
       if (sumFn) {
@@ -392,12 +628,32 @@ module {
           OpBuilder bAfter(op->getBlock(), nextIt);
           // Ensure C matches expected arg type.
           if (isa<RankedTensorType>(C.getType())) {
+            // Possibly descale the matrix first if scaling was applied.
+            Value C_used = C;
+            if (abftEnableScaling && descaleFn && rowScales && colScales) {
+              SmallVector<Type, 1> descaleResults;
+              for (Type t : descaleFn.getFunctionType().getResults())
+                descaleResults.push_back(t);
+              // Ensure inputs match expected types for descale_matrix.
+              Value dArgC = C;
+              auto expectedDescaleCArg = descaleFn.getFunctionType().getInput(0);
+              if (dArgC.getType() != expectedDescaleCArg)
+                dArgC = bAfter.create<tensor::CastOp>(loc, expectedDescaleCArg, dArgC).getResult();
+              Value dArgRow = rowScales;
+              auto expectedDescaleRowArg = descaleFn.getFunctionType().getInput(1);
+              if (dArgRow.getType() != expectedDescaleRowArg)
+                dArgRow = bAfter.create<tensor::CastOp>(loc, expectedDescaleRowArg, dArgRow).getResult();
+              Value dArgCol = colScales;
+              auto expectedDescaleColArg = descaleFn.getFunctionType().getInput(2);
+              if (dArgCol.getType() != expectedDescaleColArg)
+                dArgCol = bAfter.create<tensor::CastOp>(loc, expectedDescaleColArg, dArgCol).getResult();
+              auto descaleCall = bAfter.create<func::CallOp>(loc, StringRef("descale_matrix"), TypeRange(descaleResults), ValueRange{dArgC, dArgRow, dArgCol});
+              C_used = descaleCall.getResult(0);
+            }
             Type expectedSumArg = sumFn.getFunctionType().getInput(0);
-            Value sumArg = C;
+            Value sumArg = C_used;
             if (sumArg.getType() != expectedSumArg) {
-              sumArg =
-                  bAfter.create<tensor::CastOp>(loc, expectedSumArg, sumArg)
-                      .getResult();
+              sumArg = bAfter.create<tensor::CastOp>(loc, expectedSumArg, sumArg).getResult();
             }
             SmallVector<Type, 1> sumResultTypes;
             for (Type t : sumFn.getFunctionType().getResults())
@@ -500,12 +756,12 @@ module {
                       loc, StringRef("rowvec_mul_mat"), TypeRange(t1Results),
                       ValueRange{t1Args});
                   Value t1 = t1Call.getResult(0);
-                  // c1 = sum over rows of C -> column_checksum(C)
+                  // c1 = sum over rows of C -> column_checksum(C_used)
                   SmallVector<Type, 1> c1Results;
                   for (Type t : colFn.getFunctionType().getResults())
                     c1Results.push_back(t);
                   // Ensure C matches column_checksum expected input type.
-                  Value c1Arg = C;
+                  Value c1Arg = C_used;
                   if (colFn) {
                     Type expectedColArg = colFn.getFunctionType().getInput(0);
                     if (c1Arg.getType() != expectedColArg)
@@ -555,12 +811,12 @@ module {
                         loc, StringRef("mat_mul_colvec"), TypeRange(t2Results),
                         ValueRange{t2Args});
                     Value t2 = t2Call.getResult(0);
-                    // c2 = sum over columns of C -> row_checksum(C)
+                    // c2 = sum over columns of C -> row_checksum(C_used)
                     SmallVector<Type, 1> c2Results;
                     for (Type t : rowFn.getFunctionType().getResults())
                       c2Results.push_back(t);
                     // Ensure C matches row_checksum expected input type.
-                    Value c2Arg = C;
+                    Value c2Arg = C_used;
                     if (rowFn) {
                       Type expectedRowArg = rowFn.getFunctionType().getInput(0);
                       if (c2Arg.getType() != expectedRowArg)
