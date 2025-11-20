@@ -23,9 +23,13 @@ class StripDebugOpsPass
     : public impl::StripDebugOpsPassBase<StripDebugOpsPass> {
 public:
   void runOnOperation() override {
+    // Only strip ops that are explicitly marked DebugOnly. Historically we
+    // removed control-flow assert ops here as well, but removing all
+    // `cf.assert` operations can drop runtime checks that users rely on when
+    // debugging/tampering. Leave `cf.assert` in place so downstream lowering
+    // can choose how to handle or lower them.
     getOperation()->walk([](Operation *op) {
-      if (isa<mlir::cf::AssertOp>(op) ||
-          op->hasTrait<OpTrait::IREE::Util::DebugOnly>()) {
+      if (op->hasTrait<OpTrait::IREE::Util::DebugOnly>()) {
         op->erase();
       }
     });
