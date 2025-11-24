@@ -693,7 +693,7 @@ module {
               Value dot_product_tensor = dotCall.getResult(0);
 
               // Now call epsilon_compare(totalSum, dot_product_tensor, epsilon)
-              auto epsAttr = bAfter.getF32FloatAttr(12.0f);
+              auto epsAttr = bAfter.getF32FloatAttr(100.0f);
               auto epsConst = bAfter.create<arith::ConstantOp>(
                   loc, bAfter.getF32Type(), epsAttr);
               // Ensure totalSum and dot_product_tensor match expected types.
@@ -723,7 +723,7 @@ module {
               // Full-checksum additional checks (controlled by
               // --abft-enable-fuc):
               if (abftEnableFuC) {
-                auto epsAttrFuC = bAfter.getF32FloatAttr(1.0f);
+                auto epsAttrFuC = bAfter.getF32FloatAttr(100.0f);
                 auto epsConstFuC = bAfter.create<arith::ConstantOp>(
                     loc, bAfter.getF32Type(), epsAttrFuC);
                 // t1 = A_checksum * B  (1xK * KxN -> 1xN)

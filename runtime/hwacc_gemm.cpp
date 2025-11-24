@@ -232,6 +232,36 @@ void hwacc_gemm_f32(const float* A, const float* B, float* C, int64_t M,
   } else {
     printf("GEMM result verification PASSED!\n");
   }
+
+  // Optional logging: write oc-dot and per-element checksum differences
+  // Enable by setting either:
+  // - env IREE_HWACC_LOGFILE to a path to append logs to, or
+  // - env IREE_HWACC_ENABLE_LOG (non-empty) to use default /tmp/hwacc_gemm.log
+  const char* hwacc_logfile = getenv("IREE_HWACC_LOGFILE");
+  const char* hwacc_enable = getenv("IREE_HWACC_ENABLE_LOG");
+  FILE* logf = NULL;
+  if (hwacc_logfile != NULL && hwacc_logfile[0] != '\0') {
+    logf = fopen(hwacc_logfile, "a");
+  } else if (hwacc_enable != NULL && hwacc_enable[0] != '\0') {
+    logf = fopen("/tmp/hwacc_gemm.log", "a");
+  }
+
+  if (logf) {
+    fprintf(logf, "--- hwacc_gemm_f32 verification log ---\n");
+    fprintf(logf, "OC: %f, Dot: %f, OC-Dot: %f\n", oc, dot, oc - dot);
+    fprintf(logf, "Row diffs (C_row_checksums - row_checksum):\n");
+    for (int64_t i = 0; i < M; ++i) {
+      float diff = C_row_checksums[i] - row_checksum[i];
+      fprintf(logf, "%lld,%f\n", (long long)i, diff);
+    }
+    fprintf(logf, "Col diffs (C_col_checksums - col_checksum):\n");
+    for (int64_t i = 0; i < N; ++i) {
+      float diff = C_col_checksums[i] - col_checksum[i];
+      fprintf(logf, "%lld,%f\n", (long long)i, diff);
+    }
+    fprintf(logf, "---------------------------------------\n");
+    fclose(logf);
+  }
 }
 
 #ifdef __cplusplus
