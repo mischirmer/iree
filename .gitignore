@@ -102,3 +102,6 @@ artifacts/
 
 
 samples/models/resnet/iree_artifacts/iree_input.mlir
+samples/models/resnet/bins/
+samples/models/resnet/classifications/
+samples/models/resnet/docker_results/
