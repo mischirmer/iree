@@ -41,7 +41,7 @@ jobs:
       SCCACHE_AZURE_KEY_PREFIX: "ci_linux_x64_clang_debug"
     steps:
       - name: "Checking out repository"
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           submodules: true
       - name: Install Python requirements
@@ -66,7 +66,7 @@ jobs:
       # would add 10+ minutes to the job.
 
       - name: Post to Discord on Failure
-        uses: sarisia/actions-status-discord@11a0bfe3b50977e38aa2bd4a4ebd296415e83c19 # v1.15.4
+        uses: sarisia/actions-status-discord@b8381b25576cb341b2af39926ab42c5056cc44ed # v1.15.5
         if: failure() && github.ref_name == 'main' && github.repository_owner == 'iree-org'
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK }}
